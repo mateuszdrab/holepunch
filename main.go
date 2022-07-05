@@ -22,8 +22,10 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
+	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
@@ -46,10 +48,17 @@ func init() {
 func main() {
 	var metricsAddr string
 	var enableLeaderElection bool
+	var nodeAnnotationExternalIp string
+	var forceNodePort bool
+	var leaseDurationSeconds uint
 	flag.StringVar(&metricsAddr, "metrics-addr", ":8080", "The address the metric endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "enable-leader-election", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
+	flag.StringVar(&nodeAnnotationExternalIp, "external-ip-annotation", "", "The annotation to set with discovered external IP")
+	flag.BoolVar(&forceNodePort, "force-nodeport", false,
+		"Ensure to expose node IP address and assigned node port even for Load Balancer services")
+	flag.UintVar(&leaseDurationSeconds, "lease-duration-seconds", 3600, "The time in seconds the UPnP port mapping is created for (defaults to 1 hour)")
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
@@ -66,10 +75,28 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Initiate API server config
+	config, err := clientcmd.BuildConfigFromFlags("", "")
+	if err != nil {
+		setupLog.Error(err, "Failed to build config context")
+		os.Exit(1)
+	}
+
+	// Create the clientset to use for label updating and checking if current node runs the workload if required
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		setupLog.Error(err, "Failed to create Clientset")
+		os.Exit(1)
+	}
+
 	if err = (&controllers.ServiceReconciler{
-		Client: mgr.GetClient(),
-		Log:    ctrl.Log.WithName("controllers").WithName("Service"),
-		Scheme: mgr.GetScheme(),
+		Client:                   mgr.GetClient(),
+		ClientSet:                clientset,
+		Log:                      ctrl.Log.WithName("controllers").WithName("Service"),
+		Scheme:                   mgr.GetScheme(),
+		NodeAnnotationExternalIp: nodeAnnotationExternalIp,
+		ForceNodePort:            forceNodePort,
+		LeaseDurationSeconds:     uint32(leaseDurationSeconds),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Service")
 		os.Exit(1)

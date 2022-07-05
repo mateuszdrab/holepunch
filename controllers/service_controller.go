@@ -2,8 +2,10 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -12,7 +14,11 @@ import (
 	"github.com/huin/goupnp/dcps/internetgateway2"
 	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -20,22 +26,41 @@ import (
 const (
 	holepunchAnnotationName          = "holepunch/punch-external"
 	holepunchPortMapAnnotationPrefix = "holepunch.port/"
-	leaseDurationSeconds             = 3600
 )
 
 // ServiceReconciler reconciles a Service object
 type ServiceReconciler struct {
 	client.Client
-	Log    logr.Logger
-	Scheme *runtime.Scheme
+	ClientSet                *kubernetes.Clientset
+	Log                      logr.Logger
+	Scheme                   *runtime.Scheme
+	NodeAnnotationExternalIp string
+	ForceNodePort            bool
+	LeaseDurationSeconds     uint32
+}
+
+type patchStringValue struct {
+	Op    string `json:"op"`
+	Path  string `json:"path"`
+	Value string `json:"value"`
 }
 
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=services/status,verbs=get
+// +kubebuilder:rbac:groups=core,resources=nodes,verbs=get,patch
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list
 
 func (r *ServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	ctx := context.Background()
 	log := r.Log.WithValues("service", req.NamespacedName)
+
+	// Get current node name and node object
+	nodeName := os.Getenv("KUBERNETES_NODENAME")
+	node, err := r.ClientSet.CoreV1().Nodes().Get(nodeName, metav1.GetOptions{})
+	if err != nil {
+		log.Error(err, "Failed to obtain node name")
+		return ctrl.Result{}, err
+	}
 
 	// Get the service
 	var service corev1.Service
@@ -49,12 +74,47 @@ func (r *ServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		return ctrl.Result{}, nil
 	}
 
-	// We only care about LoadBalancer services. We need a real internal IP to map to!
-	if service.Spec.Type != corev1.ServiceTypeLoadBalancer {
-		// This means we've put the annotation on a service that isn't a loadbalancer.
-		log.Error(nil, "Holepunch enabled on non-LoadBalancer service")
+	// We only care about LoadBalancer/NodePort services. We need a real internal IP to map to!
+	if !(service.Spec.Type == corev1.ServiceTypeLoadBalancer || service.Spec.Type == corev1.ServiceTypeNodePort) {
+		// This means we've put the annotation on a service that isn't a Loadbalancer/NodePort.
+		log.Error(nil, "Holepunch requires a NodePort or LoadBalancer type service")
 		// TODO emit event onto the service
 		return ctrl.Result{}, nil
+	}
+
+	if r.ForceNodePort && service.Spec.Type == corev1.ServiceTypeLoadBalancer {
+		// We're going to spoof that the svc type is NodePort
+		service.Spec.Type = corev1.ServiceTypeNodePort
+	}
+
+	// Ensure that current node hosts pod if NodePort and ExternalTrafficPolicy is Local or skip processing
+	if service.Spec.Type == corev1.ServiceTypeNodePort && service.Spec.ExternalTrafficPolicy == corev1.ServiceExternalTrafficPolicyTypeLocal {
+		podList, err := r.ClientSet.CoreV1().Pods(service.Namespace).List(metav1.ListOptions{LabelSelector: labels.Set(service.Spec.Selector).AsSelectorPreValidated().String()})
+		//pods, err := podInformer.Lister().Pods(service.Namespace).List(selector)
+		if err != nil {
+			log.Error(err, "Current node can't be used to expose service")
+			return ctrl.Result{}, err
+		}
+		pods := podList.Items
+
+		runsOnLocalNode := false
+
+		for _, v := range pods {
+			log.Info("Checking pod", "Pod", v.Name, "Node", v.Spec.NodeName)
+			if v.Status.Phase == corev1.PodRunning {
+				if strings.EqualFold(v.Spec.NodeName, nodeName) {
+					log.Info("Found pod that runs on this node", "Pod", v.Name)
+					runsOnLocalNode = true
+					break
+				}
+			}
+		}
+
+		if !runsOnLocalNode {
+			err := errors.New("ExternalTrafficPolicy is set to Local and no pods are running on this node")
+			log.Error(err, "Current node can't be used to expose service")
+			return ctrl.Result{}, err
+		}
 	}
 
 	// Get the port mapping, if one exists. This instructs us to setup the UPnP mappings to use a *different* external
@@ -82,13 +142,52 @@ func (r *ServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	}
 	log = log.WithValues("external-ip", externalIP)
 
-	// Find the service's IP, that we're hoping is a local network IP from the perspective of the router.
-	serviceIP, err := getServiceIP(service)
-	if err != nil {
-		log.Error(err, "Failed to get IP for service (has it not been allocated yet?)")
-		return ctrl.Result{}, err
+	// Cool part, update the current node's external-ip label
+	// This will only process node that runs the controller.
+	// If not running with leader election mode, you may need to ensure you only run one instance for all nodes belonging to a single router.
+	// For example, apply pod anti-affinity based on the region/zone node label
+	if r.NodeAnnotationExternalIp != "" {
+		annotations := node.GetAnnotations()
+		nodeAnnotationExternalIp := strings.Trim(r.NodeAnnotationExternalIp, "\"")
+
+		if val, present := annotations[nodeAnnotationExternalIp]; present && val == externalIP {
+			log.Info("Node annotation is up to date", nodeAnnotationExternalIp, externalIP)
+		} else {
+			nodeAnnotationExternalIpEscaped := strings.Replace(nodeAnnotationExternalIp, "/", "~1", 1)
+			payload := []patchStringValue{{
+				Op:    "replace",
+				Path:  "/metadata/annotations/" + nodeAnnotationExternalIpEscaped,
+				Value: externalIP,
+			}}
+			payloadBytes, _ := json.Marshal(payload)
+			_, err = r.ClientSet.CoreV1().Nodes().Patch(nodeName, types.JSONPatchType, payloadBytes)
+			if err != nil {
+				log.Error(err, "Failed to update node annotation")
+			} else {
+				log.Info("Node annotation updated", nodeAnnotationExternalIp, externalIP)
+			}
+		}
 	}
-	log = log.WithValues("service-ip", serviceIP)
+
+	var ipToMap string
+	// Find the service's IP, that we're hoping is a local network IP from the perspective of the router.
+	// This will be the current node IP on nodePort type of service
+	if service.Spec.Type == corev1.ServiceTypeLoadBalancer {
+		serviceIP, err := getServiceIP(service)
+		if err != nil {
+			log.Error(err, "Failed to get IP for service (has it not been allocated yet?)")
+			return ctrl.Result{}, err
+		}
+		ipToMap = serviceIP
+	} else if service.Spec.Type == corev1.ServiceTypeNodePort {
+		for _, na := range node.Status.Addresses {
+			if na.Type == corev1.NodeInternalIP {
+				ipToMap = na.Address
+			}
+		}
+	}
+
+	log = log.WithValues("ip-to-map", ipToMap)
 
 	description := fmt.Sprintf("Mapping for %s/%s", service.Name, service.Namespace)
 
@@ -96,7 +195,13 @@ func (r *ServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	for _, servicePort := range service.Spec.Ports {
 		// For some reason the Kubernetes Service API thinks a port can be an int32. On Linux at least it'll *always*
 		// be a uint16 so this is a safe cast.
-		portNumber := uint16(servicePort.Port)
+		var portNumber uint16
+		if service.Spec.Type == corev1.ServiceTypeLoadBalancer {
+			portNumber = uint16(servicePort.Port)
+		} else if service.Spec.Type == corev1.ServiceTypeNodePort {
+			portNumber = uint16(servicePort.NodePort)
+		}
+
 		protocol, err := toUPnPProtocol(servicePort.Protocol)
 		if err != nil {
 			log.Error(err, "Unable to resolve protocol to use")
@@ -114,7 +219,7 @@ func (r *ServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		portLogger := log.WithValues("forwarding-port", portNumber,
 			"external-port", externalPort,
 			"upnp-description", description,
-			"lease-duration", leaseDurationSeconds)
+			"lease-duration", r.LeaseDurationSeconds)
 		portLogger.Info("Attempting to forward port from router with UPnP")
 
 		if err = router.AddPortMapping(
@@ -128,7 +233,7 @@ func (r *ServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 			// port number.
 			portNumber,
 			// Internal address on the LAN we want to forward to.
-			serviceIP,
+			ipToMap,
 			// Enabled:
 			true,
 			// Informational description for the client requesting the port forwarding.
@@ -136,16 +241,19 @@ func (r *ServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 			// How long should the port forward last for in seconds.
 			// If you want to keep it open for longer and potentially across router
 			// resets, you might want to periodically request before this elapses.
-			leaseDurationSeconds,
+			r.LeaseDurationSeconds,
 		); err != nil {
+			// When trying to map a port that is already mapped to another node/application, error 718 is usually returned.
+			// This error would be expected when operating without leader election, with leader election NodePort mapping won't work well as only the node running as leader will be used to map the service externally - this will make all traffic flow through that node and if ExternalTrafficPolicy is set to Local and the pod doesn't run on the leader node, the service will simply not map as it wouldn't work anyway.
+			// miniupnpd has something called secure mode, this will prevent a device from mapping ports to IPs other than it's own. PFsense for example hard-codes secure mode to be enabled, breaking LoadBalancer type mapping completely. This is why NodePort option was added to work around that issue.
 			portLogger.Error(err, "Failed to configure UPnP port-forwarding")
 			return ctrl.Result{}, err
 		}
 	}
 
 	// Even on a "success" we need to come back before our lease is up to redo it.
-	log.Info("Success, ports forwarded.", "reschedule-seconds", leaseDurationSeconds - 30)
-	return ctrl.Result{RequeueAfter: (leaseDurationSeconds - 30) * time.Second}, nil
+	log.Info("Success, ports forwarded.", "reschedule-seconds", r.LeaseDurationSeconds-30)
+	return ctrl.Result{RequeueAfter: time.Duration((r.LeaseDurationSeconds - 30) * uint32(time.Second))}, nil
 }
 
 func getHolepunchPortMapping(service corev1.Service) (map[uint16]uint16, error) {
