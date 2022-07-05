@@ -195,12 +195,7 @@ func (r *ServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	for _, servicePort := range service.Spec.Ports {
 		// For some reason the Kubernetes Service API thinks a port can be an int32. On Linux at least it'll *always*
 		// be a uint16 so this is a safe cast.
-		var portNumber uint16
-		if service.Spec.Type == corev1.ServiceTypeLoadBalancer {
-			portNumber = uint16(servicePort.Port)
-		} else if service.Spec.Type == corev1.ServiceTypeNodePort {
-			portNumber = uint16(servicePort.NodePort)
-		}
+		internalPort := uint16(servicePort.Port)
 
 		protocol, err := toUPnPProtocol(servicePort.Protocol)
 		if err != nil {
@@ -209,14 +204,19 @@ func (r *ServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		}
 
 		// Figure out if we want to map the port
-		externalPort, ok := portMapping[portNumber]
+		externalPort, ok := portMapping[internalPort]
 		if !ok {
 			// We didn't have a mapping for this port.
-			externalPort = portNumber
+			externalPort = internalPort
+		}
+
+		// If NodePort type, then map to internal node port rather than specified port
+		if service.Spec.Type == corev1.ServiceTypeNodePort {
+			internalPort = uint16(servicePort.NodePort)
 		}
 
 		// Log out
-		portLogger := log.WithValues("forwarding-port", portNumber,
+		portLogger := log.WithValues("forwarding-port", internalPort,
 			"external-port", externalPort,
 			"upnp-description", description,
 			"lease-duration", r.LeaseDurationSeconds)
@@ -231,7 +231,7 @@ func (r *ServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 			// Internal port number on the LAN to forward to.
 			// Some routers might not support this being different to the external
 			// port number.
-			portNumber,
+			internalPort,
 			// Internal address on the LAN we want to forward to.
 			ipToMap,
 			// Enabled:
@@ -252,8 +252,10 @@ func (r *ServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	}
 
 	// Even on a "success" we need to come back before our lease is up to redo it.
-	log.Info("Success, ports forwarded.", "reschedule-seconds", r.LeaseDurationSeconds-30)
-	return ctrl.Result{RequeueAfter: time.Duration((r.LeaseDurationSeconds - 30) * uint32(time.Second))}, nil
+	rescheduleIn := (time.Duration(r.LeaseDurationSeconds-30) * time.Second)
+	log.Info("Success, ports forwarded.", "reschedule-in", rescheduleIn)
+	return ctrl.Result{RequeueAfter: rescheduleIn}, nil
+
 }
 
 func getHolepunchPortMapping(service corev1.Service) (map[uint16]uint16, error) {
