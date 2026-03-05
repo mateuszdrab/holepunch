@@ -61,7 +61,7 @@ func main() {
 		"Ensure to expose node IP address and assigned node port even for Load Balancer services")
 	flag.UintVar(&leaseDurationSeconds, "lease-duration-seconds", 3600, "The time in seconds the UPnP port mapping is created for (defaults to 1 hour)")
 	opts := zap.Options{
-		Development: true,
+		Development: false,
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
