@@ -243,8 +243,11 @@ func (r *ServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 			// When trying to map a port that is already mapped to another node/application, error 718 is usually returned.
 			// This error would be expected when operating without leader election, with leader election NodePort mapping won't work well as only the node running as leader will be used to map the service externally - this will make all traffic flow through that node and if ExternalTrafficPolicy is set to Local and the pod doesn't run on the leader node, the service will simply not map as it wouldn't work anyway.
 			// miniupnpd has something called secure mode, this will prevent a device from mapping ports to IPs other than it's own. PFsense for example hard-codes secure mode to be enabled, breaking LoadBalancer type mapping completely. This is why NodePort option was added to work around that issue.
-			portLogger.Error(err, "Failed to configure UPnP port-forwarding")
-			return ctrl.Result{}, err
+			// Log at Info level (not Error) so that no stack trace is emitted for this expected/transient
+			// UPnP failure. Returning nil (with RequeueAfter) also prevents controller-runtime from logging a
+			// second stack trace for the same error while still retrying with a delay.
+			portLogger.Info("Failed to configure UPnP port-forwarding", "error", err)
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		}
 	}
 
