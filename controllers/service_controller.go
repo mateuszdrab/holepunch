@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -180,11 +181,7 @@ func (r *ServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		}
 		ipToMap = serviceIP
 	} else if service.Spec.Type == corev1.ServiceTypeNodePort {
-		for _, na := range node.Status.Addresses {
-			if na.Type == corev1.NodeInternalIP {
-				ipToMap = na.Address
-			}
-		}
+		ipToMap = getNodeIPv4(node.Status.Addresses)
 	}
 
 	log = log.WithValues("ip-to-map", ipToMap)
@@ -301,6 +298,18 @@ func toUPnPProtocol(serviceProtocol corev1.Protocol) (string, error) {
 		// This could happen, for example with corev1.ProtocolSTCP
 		return "", errors.New(fmt.Sprintf("protocol type %s not supported", serviceProtocol))
 	}
+}
+
+func getNodeIPv4(addresses []corev1.NodeAddress) string {
+	for _, na := range addresses {
+		if na.Type == corev1.NodeInternalIP {
+			ip := net.ParseIP(na.Address)
+			if ip != nil && ip.To4() != nil {
+				return na.Address
+			}
+		}
+	}
+	return ""
 }
 
 func getServiceIP(service corev1.Service) (string, error) {
