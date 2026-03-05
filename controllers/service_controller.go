@@ -51,13 +51,12 @@ type patchStringValue struct {
 // +kubebuilder:rbac:groups=core,resources=nodes,verbs=get,patch
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list
 
-func (r *ServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
-	ctx := context.Background()
+func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("service", req.NamespacedName)
 
 	// Get current node name and node object
 	nodeName := os.Getenv("KUBERNETES_NODENAME")
-	node, err := r.ClientSet.CoreV1().Nodes().Get(nodeName, metav1.GetOptions{})
+	node, err := r.ClientSet.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 	if err != nil {
 		log.Error(err, "Failed to obtain node name")
 		return ctrl.Result{}, err
@@ -90,7 +89,7 @@ func (r *ServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 
 	// Ensure that current node hosts pod if NodePort and ExternalTrafficPolicy is Local or skip processing
 	if service.Spec.Type == corev1.ServiceTypeNodePort && service.Spec.ExternalTrafficPolicy == corev1.ServiceExternalTrafficPolicyTypeLocal {
-		podList, err := r.ClientSet.CoreV1().Pods(service.Namespace).List(metav1.ListOptions{LabelSelector: labels.Set(service.Spec.Selector).AsSelectorPreValidated().String()})
+		podList, err := r.ClientSet.CoreV1().Pods(service.Namespace).List(ctx, metav1.ListOptions{LabelSelector: labels.Set(service.Spec.Selector).AsSelectorPreValidated().String()})
 		//pods, err := podInformer.Lister().Pods(service.Namespace).List(selector)
 		if err != nil {
 			log.Error(err, "Current node can't be used to expose service")
@@ -161,7 +160,7 @@ func (r *ServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 				Value: externalIP,
 			}}
 			payloadBytes, _ := json.Marshal(payload)
-			_, err = r.ClientSet.CoreV1().Nodes().Patch(nodeName, types.JSONPatchType, payloadBytes)
+			_, err = r.ClientSet.CoreV1().Nodes().Patch(ctx, nodeName, types.JSONPatchType, payloadBytes, metav1.PatchOptions{})
 			if err != nil {
 				log.Error(err, "Failed to update node annotation")
 			} else {
