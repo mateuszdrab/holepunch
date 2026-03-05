@@ -72,6 +72,15 @@ When enabled, Holepunch will treat `LoadBalancer` services as if they were `Node
 | `--force-nodeport` | `false` | Treat `LoadBalancer` services as `NodePort` services, mapping the node's IP and node port. Useful for routers with secure mode enabled. |
 | `--lease-duration-seconds` | `3600` | The duration in seconds for which the UPnP port mapping is created. The controller will re-create the mapping before it expires. |
 
+#### Logging Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--zap-log-level` | `info` | Log verbosity level. One of `debug`, `info`, `error`, `panic`, or a positive integer for custom verbose levels (e.g. `1` to show verbose reconciler detail). |
+| `--zap-devel` | `false` | Development mode: enables console encoding, `debug` log level, and stack traces on `warn`+. When `false` (production mode), output is JSON, level is `info`, and stack traces only appear on `panic`. |
+| `--zap-encoder` | `json` | Log output encoding. One of `json` or `console`. |
+| `--zap-stacktrace-level` | `panic` | Minimum log level at which a stack trace is attached. One of `info`, `error`, or `panic`. Overrides the level implied by `--zap-devel`. |
+
 ### Annotating Nodes with External IP
 
 Holepunch can automatically annotate the Kubernetes node it runs on with the external IP address discovered from the router.

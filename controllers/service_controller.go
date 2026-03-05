@@ -51,13 +51,12 @@ type patchStringValue struct {
 // +kubebuilder:rbac:groups=core,resources=nodes,verbs=get,patch
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list
 
-func (r *ServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
-	ctx := context.Background()
+func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("service", req.NamespacedName)
 
 	// Get current node name and node object
 	nodeName := os.Getenv("KUBERNETES_NODENAME")
-	node, err := r.ClientSet.CoreV1().Nodes().Get(nodeName, metav1.GetOptions{})
+	node, err := r.ClientSet.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 	if err != nil {
 		log.Error(err, "Failed to obtain node name")
 		return ctrl.Result{}, err
@@ -90,7 +89,7 @@ func (r *ServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 
 	// Ensure that current node hosts pod if NodePort and ExternalTrafficPolicy is Local or skip processing
 	if service.Spec.Type == corev1.ServiceTypeNodePort && service.Spec.ExternalTrafficPolicy == corev1.ServiceExternalTrafficPolicyTypeLocal {
-		podList, err := r.ClientSet.CoreV1().Pods(service.Namespace).List(metav1.ListOptions{LabelSelector: labels.Set(service.Spec.Selector).AsSelectorPreValidated().String()})
+		podList, err := r.ClientSet.CoreV1().Pods(service.Namespace).List(ctx, metav1.ListOptions{LabelSelector: labels.Set(service.Spec.Selector).AsSelectorPreValidated().String()})
 		//pods, err := podInformer.Lister().Pods(service.Namespace).List(selector)
 		if err != nil {
 			log.Error(err, "Current node can't be used to expose service")
@@ -101,10 +100,10 @@ func (r *ServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		runsOnLocalNode := false
 
 		for _, v := range pods {
-			log.Info("Checking pod", "Pod", v.Name, "Node", v.Spec.NodeName)
+			log.V(1).Info("Checking pod", "Pod", v.Name, "Node", v.Spec.NodeName)
 			if v.Status.Phase == corev1.PodRunning {
 				if strings.EqualFold(v.Spec.NodeName, nodeName) {
-					log.Info("Found pod that runs on this node", "Pod", v.Name)
+					log.V(1).Info("Found pod that runs on this node", "Pod", v.Name)
 					runsOnLocalNode = true
 					break
 				}
@@ -161,7 +160,7 @@ func (r *ServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 				Value: externalIP,
 			}}
 			payloadBytes, _ := json.Marshal(payload)
-			_, err = r.ClientSet.CoreV1().Nodes().Patch(nodeName, types.JSONPatchType, payloadBytes)
+			_, err = r.ClientSet.CoreV1().Nodes().Patch(ctx, nodeName, types.JSONPatchType, payloadBytes, metav1.PatchOptions{})
 			if err != nil {
 				log.Error(err, "Failed to update node annotation")
 			} else {
@@ -243,8 +242,11 @@ func (r *ServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 			// When trying to map a port that is already mapped to another node/application, error 718 is usually returned.
 			// This error would be expected when operating without leader election, with leader election NodePort mapping won't work well as only the node running as leader will be used to map the service externally - this will make all traffic flow through that node and if ExternalTrafficPolicy is set to Local and the pod doesn't run on the leader node, the service will simply not map as it wouldn't work anyway.
 			// miniupnpd has something called secure mode, this will prevent a device from mapping ports to IPs other than it's own. PFsense for example hard-codes secure mode to be enabled, breaking LoadBalancer type mapping completely. This is why NodePort option was added to work around that issue.
+			// Log at Error level so the failure is always visible. Stack trace is suppressed by default
+			// (Development: false) and only shown when --zap-devel is set. Returning nil (with RequeueAfter)
+			// prevents controller-runtime from logging a second "Reconciler error" line for the same error.
 			portLogger.Error(err, "Failed to configure UPnP port-forwarding")
-			return ctrl.Result{}, err
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		}
 	}
 

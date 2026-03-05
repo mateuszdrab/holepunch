@@ -28,6 +28,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/JamesLaverack/holepunch/controllers"
 	// +kubebuilder:scaffold:imports
@@ -59,16 +60,19 @@ func main() {
 	flag.BoolVar(&forceNodePort, "force-nodeport", false,
 		"Ensure to expose node IP address and assigned node port even for Load Balancer services")
 	flag.UintVar(&leaseDurationSeconds, "lease-duration-seconds", 3600, "The time in seconds the UPnP port mapping is created for (defaults to 1 hour)")
+	opts := zap.Options{
+		Development: false,
+	}
+	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
-	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:             scheme,
-		MetricsBindAddress: metricsAddr,
-		Port:               9443,
-		LeaderElection:     enableLeaderElection,
-		LeaderElectionID:   "81773bb2.holepunch.jameslaverack.com",
+		Scheme:           scheme,
+		Metrics:          metricsserver.Options{BindAddress: metricsAddr},
+		LeaderElection:   enableLeaderElection,
+		LeaderElectionID: "81773bb2.holepunch.jameslaverack.com",
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
