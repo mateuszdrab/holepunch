@@ -1,8 +1,7 @@
 name: Build & Push Container Image
 
-# Build a container image on every PR (to validate the Dockerfile) and push it when the main
-# branch or a version tag is pushed. This isn't dependant on the tests passing or the linter
-# being happy.
+# Build and push a container image on every PR, push to main, and version tags.
+# This isn't dependent on the tests passing or the linter being happy.
 on:
   push:
     branches: [main]
@@ -24,7 +23,6 @@ jobs:
 
     steps:
       - name: Log in to the Container registry
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@42d299face0c5c43a0487c477f595ac9cf22f1a7
         with:
           registry: ${{ env.REGISTRY }}
@@ -55,6 +53,6 @@ jobs:
         with:
           context: .
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
